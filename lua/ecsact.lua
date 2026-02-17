@@ -155,6 +155,8 @@ vim.api.nvim_create_autocmd("User", {
 vim.api.nvim_create_autocmd("FileType", {
 	pattern = "ecsact",
 	callback = function(args)
+		vim.bo[args.buf].commentstring = "// %s"
+		vim.bo[args.buf].comments = "s1:/*,mb:*,ex:*/,://"
 		pcall(vim.treesitter.start, args.buf)
 		ensure_ecsact_lsp_started()
 	end,

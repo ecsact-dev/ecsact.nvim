@@ -52,6 +52,8 @@
 
 (parameter_name) @variable.parameter
 
+(comment) @comment
+
 ; "with" @function
 "enum" @keyword
 "component" @keyword
