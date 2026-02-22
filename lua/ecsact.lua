@@ -1,5 +1,19 @@
 vim.filetype.add({ extension = { ecsact = "ecsact" } })
 
+--- @class ecsact.lsp.EcsactSymbolParams
+--- @field textDocument lsp.TextDocumentIdentifier
+--- @field position lsp.Position
+
+--- @class ecsact.lsp.EcsactCppSymbolResult
+--- @field type string
+--- @field implementation string
+
+--- @class ecsact.lsp.EcsactSymbolResult
+--- @field c string
+--- @field cpp ecsact.lsp.EcsactCppSymbolResult
+--- @field csharp string
+--- @field rust string
+
 local function setup_tree_sitter()
 	require("nvim-treesitter.parsers").ecsact = {
 		install_info = {
@@ -132,6 +146,10 @@ local function ensure_ecsact_lsp_started(current_buf)
 		end)
 	end
 
+	if #clients == 0 then
+		vim.fn.delete(lsp_exe_path)
+	end
+
 	-- Build the LSP server
 	update_progress("building @ecsact//ecsact_lsp_server")
 	run_bazel({ "build", "@ecsact//ecsact_lsp_server" }, function(code, stdout, stderr)
@@ -231,6 +249,132 @@ vim.api.nvim_create_user_command("EcsactLspRefresh", function()
 			ensure_ecsact_lsp_started(buf)
 		end
 	end, 500)
+end, {})
+
+--- @param symbol ecsact.lsp.EcsactSymbolResult
+local function goto_impl(symbol)
+	local win = vim.api.nvim_get_current_win()
+
+	local clangd_clients = vim.lsp.get_clients({
+		name = "clangd",
+	})
+
+	if #clangd_clients == 0 then
+		vim.notify("no clangd clients available")
+		return
+	end
+
+	--- @type lsp.WorkspaceSymbolParams
+	local params = { query = symbol.cpp.implementation }
+	if params.query == "" then
+		params.query = symbol.cpp.type
+	end
+
+	local finished_requests = 0
+
+	--- @type lsp.WorkspaceSymbol[]
+	local all_symbol_locations = {}
+
+	local score_patterns = {
+		vim.regex("\\v\\.ecsact\\.(c|cpp|cc|cxx)$"),
+		vim.regex("\\v\\.ecsact\\.(h|hh|hpp|hxx)$"),
+		vim.regex("\\v(c|cpp|cc|cxx)$"),
+		vim.regex("\\vc$"),
+	}
+
+	--- @param loc lsp.WorkspaceSymbol
+	--- @return number
+	local function location_score(loc)
+		for score, pattern in ipairs(score_patterns) do
+			if pattern:match_str(loc.location.uri) then
+				return score
+			end
+		end
+
+		return #score_patterns + 1
+	end
+
+	local function done_all_requests()
+		table.sort(all_symbol_locations, function(a, b)
+			return location_score(a) > location_score(b)
+		end)
+
+		local entry = all_symbol_locations[1]
+
+		if entry then
+			local bufnr = vim.uri_to_bufnr(entry.location.uri)
+			vim.api.nvim_win_set_buf(win, bufnr)
+			if entry.location.range then
+				vim.api.nvim_win_set_cursor(win, {
+					entry.location.range.start.line + 1,
+					entry.location.range.start.character,
+				})
+			end
+		else
+			vim.notify("ecsact impl not found", vim.log.levels.ERROR)
+		end
+	end
+
+	for _, clangd in ipairs(clangd_clients) do
+		--- @param err lsp.ResponseError|nil
+		--- @param result lsp.WorkspaceSymbol[]|nil
+		local function response_handler(err, result, context, config)
+			finished_requests = finished_requests + 1
+			result = result or {}
+
+			for _, entry in ipairs(result) do
+				table.insert(all_symbol_locations, entry)
+			end
+
+			if finished_requests == #clangd_clients then
+				vim.schedule(done_all_requests)
+			end
+
+			if err then
+				vim.notify(err.message, vim.log.levels.ERROR)
+			end
+		end
+
+		local success = clangd:request("workspace/symbol", params, response_handler)
+
+		if not success then
+			finished_requests = finished_requests + 1
+			if finished_requests == #clangd_clients then
+				vim.schedule(done_all_requests)
+			end
+		end
+	end
+end
+
+vim.api.nvim_create_user_command("EcsactLspGotoImpl", function()
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local ecsact_lsp_clients = vim.lsp.get_clients({
+		name = "ecsact",
+	})
+
+	assert(#ecsact_lsp_clients > 0, "no ecsact lsp clients available")
+
+	for _, client in ipairs(ecsact_lsp_clients) do
+		--- @type ecsact.lsp.EcsactSymbolParams
+		local params = {
+			textDocument = { uri = vim.uri_from_bufnr(0) },
+			position = {
+				line = cursor[1] - 1,
+				character = cursor[2],
+			},
+		}
+
+		---@diagnostic disable-next-line: param-type-mismatch
+		local result = client:request_sync("ecsact/symbols", params)
+		if result and result.result then
+			goto_impl(result.result)
+			return
+		elseif result then
+			vim.notify(result.err.message, vim.log.levels.ERROR)
+		else
+			vim.notify("no response from ecsact lsp", vim.log.levels.ERROR)
+		end
+	end
 end, {})
 
 return {
