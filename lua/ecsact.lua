@@ -14,9 +14,22 @@ local function setup_tree_sitter()
 	}
 end
 
+local function get_ecsact_lsp_path()
+	local cache_dir = vim.fn.stdpath("cache") .. "/ecsact-lsp"
+	vim.fn.mkdir(cache_dir, "p")
+	local lsp_exe_path = cache_dir .. "/ecsact_lsp_server"
+	if vim.fn.has("win32") == 1 then
+		lsp_exe_path = lsp_exe_path .. ".exe"
+	end
+
+	return lsp_exe_path
+end
+
 local lsp_is_starting = false
-local function ensure_ecsact_lsp_started()
-	local current_buf = vim.api.nvim_get_current_buf()
+local function ensure_ecsact_lsp_started(current_buf)
+	if current_buf == 0 or current_buf == nil then
+		current_buf = vim.api.nvim_get_current_buf()
+	end
 
 	if lsp_is_starting then
 		return
@@ -37,13 +50,36 @@ local function ensure_ecsact_lsp_started()
 		return
 	end
 
-	lsp_is_starting = true
-	local cache_dir = vim.fn.stdpath("cache") .. "/ecsact-lsp"
-	vim.fn.mkdir(cache_dir, "p")
-	local lsp_exe_path = cache_dir .. "/ecsact_lsp_server"
-	if vim.fn.has("win32") == 1 then
-		lsp_exe_path = lsp_exe_path .. ".exe"
+	local has_fidget, fidget = pcall(require, "fidget")
+	local fidget_progress = nil
+
+	if has_fidget then
+		fidget_progress = fidget.progress.handle.create({
+			key = "ecsact.nvim",
+			title = "ecsact.nvim lsp",
+			message = "",
+			lsp_client = { name = "ecsact.nvim" },
+			percentage = 0,
+			cancellable = true,
+		})
 	end
+
+	--- @param message string
+	local function update_progress(message)
+		if has_fidget and fidget_progress then
+			fidget_progress.message = message
+		end
+	end
+
+	local function cancel_fidget(reason)
+		update_progress(reason)
+		if has_fidget and fidget_progress then
+			fidget_progress:cancel()
+		end
+	end
+
+	lsp_is_starting = true
+	local lsp_exe_path = get_ecsact_lsp_path()
 
 	local function start_lsp(exe_path)
 		lsp_is_starting = false
@@ -80,6 +116,7 @@ local function ensure_ecsact_lsp_started()
 		if not handle then
 			lsp_is_starting = false
 			vim.notify("ecsact.nvim: Failed to spawn bazel", vim.log.levels.ERROR)
+			cancel_fidget("failed to spawn bazel")
 			return
 		end
 
@@ -96,18 +133,22 @@ local function ensure_ecsact_lsp_started()
 	end
 
 	-- Build the LSP server
+	update_progress("building @ecsact//ecsact_lsp_server")
 	run_bazel({ "build", "@ecsact//ecsact_lsp_server" }, function(code, stdout, stderr)
 		if code ~= 0 then
 			lsp_is_starting = false
 			vim.notify("ecsact.nvim: bazel build failed\n" .. stderr, vim.log.levels.ERROR)
+			cancel_fidget("failed to build @ecsact//ecsact_lsp_server")
 			return
 		end
 
 		-- Query the output file path
+		update_progress("finding location of @ecsact//ecsact_lsp_server")
 		run_bazel({ "cquery", "@ecsact//ecsact_lsp_server", "--output=files" }, function(q_code, q_stdout, q_stderr)
 			if q_code ~= 0 then
 				lsp_is_starting = false
 				vim.notify("ecsact.nvim: bazel cquery failed\n" .. q_stderr, vim.log.levels.ERROR)
+				cancel_fidget("failed to cquery @ecsact//ecsact_lsp_server")
 				return
 			end
 
@@ -115,12 +156,14 @@ local function ensure_ecsact_lsp_started()
 			if relative_path == "" then
 				lsp_is_starting = false
 				vim.notify("ecsact.nvim: Could not resolve LSP path from bazel", vim.log.levels.ERROR)
+				cancel_fidget()
 				return
 			end
 
 			local full_path = bazel_root .. "/" .. relative_path
 			-- Copy to cache for stability
 			vim.uv.fs_copyfile(full_path, lsp_exe_path, { excl = false }, function(err)
+				cancel_fidget()
 				vim.schedule(function()
 					if err then
 						-- If we can't copy, it might be because it's running.
@@ -158,9 +201,37 @@ vim.api.nvim_create_autocmd("FileType", {
 		vim.bo[args.buf].commentstring = "// %s"
 		vim.bo[args.buf].comments = "s1:/*,mb:*,ex:*/,://"
 		pcall(vim.treesitter.start, args.buf)
-		ensure_ecsact_lsp_started()
+		ensure_ecsact_lsp_started(args.buf)
 	end,
 })
+
+vim.api.nvim_create_user_command("EcsactLspRefresh", function()
+	local ecsact_lsp_clients = vim.lsp.get_clients({
+		name = "ecsact",
+	})
+
+	local ecsact_lsp_bufs = {}
+
+	for _, client in ipairs(ecsact_lsp_clients) do
+		for buf, _ in pairs(client.attached_buffers) do
+			table.insert(ecsact_lsp_bufs, buf)
+		end
+
+		pcall(function()
+			client:stop(true)
+		end)
+	end
+
+	local lsp_exe_path = get_ecsact_lsp_path()
+	vim.defer_fn(function()
+		if vim.fn.delete(lsp_exe_path) ~= 0 then
+			vim.notify(string.format("ecsact.nvim: failed to delete %s", lsp_exe_path), vim.log.levels.ERROR)
+		end
+		for _, buf in ipairs(ecsact_lsp_bufs) do
+			ensure_ecsact_lsp_started(buf)
+		end
+	end, 500)
+end, {})
 
 return {
 	-- for lazy.nvim
